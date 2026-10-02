@@ -273,6 +273,52 @@ ok(dh.length === 2 && dh[0].kind === 'delete' && dh[0].old.start === 0 &&
    dh[1].kind === 'insert' && dh[1].now.text === '尾',
   '净变化：删除首字与段尾插入分属两块');
 
+// 先在段首插入、后在另一发布中删除原字（跨版 1→3）：纯删除的新版空区间必须计入前面的插入。
+// v1「abc」→ v2 段首插「X」（Xabc）→ v3 删「b」（Xac）。
+// 旧实现用“对齐间隙 gap”（只数恒等码点）作删除点，错报 now [1,1)；真实新版删除点应为 [2,2)。
+dh = diffHunks('abc', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 0, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 2, end: 3, replace: '' }] }, // v2 坐标 X|a|b|c
+], 1, 3);
+ok(dh.length === 2, `先插后删报为两处变化（实际 ${dh.length}）：段首插入与原字删除`);
+const delB = dh.find((h) => h.kind === 'delete');
+ok(delB && delB.old.start === 1 && delB.old.end === 2 && delB.old.text === 'b' &&
+   delB.now.start === 2 && delB.now.end === 2 && delB.now.text === '',
+  '净变化：先插后删时纯删除的新版空区间计入前面的插入 now [2,2)（非 [1,1)）');
+// 反推恢复编辑（当前版坐标 now 区间替换为 old 文字）必须逐码点还原 v1
+{
+  let cur = 'Xac';
+  for (const h of [...dh].sort((x, y) => y.now.start - x.now.start)) {
+    cur = Array.from(cur).slice(0, h.now.start)
+      .concat(Array.from(h.old.text), Array.from(cur).slice(h.now.end)).join('');
+  }
+  ok(cur === 'abc', `先插后删场景的恢复编辑精确还原目标快照（实际「${cur}」）`);
+}
+// 中途对照仍保留真实历史：1→2 只见插入，2→3 只见删除（删除点即 v2/v3 的 [2,2)）
+ok(diffHunks('abc', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 0, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 2, end: 3, replace: '' }] },
+], 2, 3)[0].now.start === 2, '净变化：2→3 中途对照的删除点仍为新版 [2,2)');
+
+// 对称：先删原字、后在段尾插入（跨版 1→3）：纯插入的旧版空区间必须计入前面的删除。
+// v1「abc」→ v2 删「b」（ac）→ v3 段尾插「X」（acX）。旧实现错报 old [2,2)，应为 [3,3)。
+dh = diffHunks('abc', [
+  { version: 2, edits: [{ id: 3, start: 1, end: 2, replace: '' }] },
+  { version: 3, edits: [{ id: 4, start: 2, end: 2, replace: 'X' }] }, // v2 坐标 a|c|▷
+], 1, 3);
+const insTail = dh.find((h) => h.kind === 'insert');
+ok(insTail && insTail.now.text === 'X' && insTail.now.start === 2 && insTail.now.end === 3 &&
+   insTail.old.start === 3 && insTail.old.end === 3 && insTail.old.text === '',
+  '净变化：先删后插时纯插入的旧版空区间计入前面的删除 old [3,3)（非 [2,2)）');
+{
+  let cur = 'acX';
+  for (const h of [...dh].sort((x, y) => y.now.start - x.now.start)) {
+    cur = Array.from(cur).slice(0, h.now.start)
+      .concat(Array.from(h.old.text), Array.from(cur).slice(h.now.end)).join('');
+  }
+  ok(cur === 'abc', `先删后插场景的恢复编辑精确还原目标快照（实际「${cur}」）`);
+}
+
 // 未变段（版本发布了其他段的修订，但该段在 a→b 区间无任何步骤）：不产生变化块
 dh = diffHunks('无改动段落', [], 1, 2);
 ok(dh.length === 0 && diffLineage('无改动段落', [], 1, 2).versions[2] === '无改动段落',

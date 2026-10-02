@@ -239,8 +239,12 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
   if (!seqA || !seqB) throw new Error('diffLineage：对照版本缺少重放快照（版本不可达）');
 
   // 身份序列 LCS 对齐 → 逐条操作，并给出统一几何坐标：
-  // aPos/bPos 为操作码点在旧/新版的码点下标；gap 为“对齐间隙”——该操作位于第几个恒等码点之后
-  // （两版恒等码点之间的同一处位置）。原位替换的删除与插入共享同一 gap；位置不同的删除与插入
+  // aPos/bPos 为操作码点在旧/新版的码点下标（eq 操作两者一致）；gap 为“对齐间隙”——
+  // 该操作位于第几个恒等码点之后（两版恒等码点之间的同一处位置），只用于判定原位替换。
+  // 注意 gap 只随恒等码点递增，而空区间端点必须取该版本的真实码点位置：
+  // 纯删除在新版没有码点，其删除点 bPos 仍计入它之前的插入（如新版段首先插了字，
+  // 后续删除点在新版应落在插入之后）；纯插入在旧版的空区间 aPos 同理计入它之前的删除。
+  // 原位替换的删除与插入共享同一 gap；位置不同的删除与插入
   // （如删旧 b、又在末尾另插新 b）gap 不同，不能合并/抵消。
   const ops = alignTokenOps(seqA, seqB);
   let pa = 0;
@@ -249,7 +253,7 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
   for (const o of ops) {
     if (o.op === 'eq') { o.aPos = pa; o.bPos = pb; o.gap = gap; pa++; pb++; gap++; }
     else if (o.op === 'del') { o.aPos = pa; o.bPos = pb; o.gap = gap; pa++; }
-    else { o.bPos = pb; o.aPos = pa; o.gap = gap; pb++; }
+    else { o.aPos = pa; o.bPos = pb; o.gap = gap; pb++; }
   }
 
   // 相邻 del/ins 合并为变化块：按“连续非 eq 段”严格分组（夹着 eq 的不相连）。
@@ -284,10 +288,14 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
   for (const h of rawHunks) {
     const dels = h.ops.filter((o) => o.op === 'del');
     const inss = h.ops.filter((o) => o.op === 'ins');
-    // 半开区间按各自版本码点下标；纯插入/纯删除的空区间落在共同的对齐间隙处
-    const oldStart = dels.length ? dels[0].aPos : inss[0].gap;
+    // 半开区间按各自版本码点下标。
+    // 纯插入（无删除）的旧版空区间取插入点在旧版的真实位置 aPos（计入其之前的删除）；
+    // 纯删除（无插入）的新版空区间取删除点在新版的真实位置 bPos（计入其之前的插入）。
+    // 绝不能用 gap：gap 只数恒等码点，会把“先在别处插入、后在原字删除”的删除点
+    // 错放到插入之前的坐标（恢复编辑据此会错位，被合版自检拒绝）。
+    const oldStart = dels.length ? dels[0].aPos : inss[0].aPos;
     const oldEnd = dels.length ? dels[dels.length - 1].aPos + 1 : oldStart;
-    const newStart = inss.length ? inss[0].bPos : dels[0].gap;
+    const newStart = inss.length ? inss[0].bPos : dels[0].bPos;
     const newEnd = inss.length ? inss[inss.length - 1].bPos + 1 : newStart;
     const oldIds = dels.map((o) => seqA[o.ai]);
     const newIds = inss.map((o) => seqB[o.bj]);

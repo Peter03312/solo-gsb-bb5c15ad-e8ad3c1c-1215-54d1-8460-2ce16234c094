@@ -61,12 +61,14 @@ async function main() {
   // ---------- 构造版本链 ----------
   // 段1：v1「申请人张三称：我于2024年3月1日收到通知。」
   // 段2：v1「保留段落始终不变。」
+  // 段3：v1「abc」（“先插后删”坐标回归专用）
   // v2：段1 日期 3月1日 -> 3月2日
   // v3：段1 张三 -> 张三丰；日期 3月2日 -> 3月上旬
   // v4：参与者关注的段2做一次同文替换（正文逐码点不变，恢复时不应产生提议）
   const seg1v1 = '申请人张三称：我于2024年3月1日收到通知。';
   const seg2v1 = '保留段落始终不变。';
-  const transcript = `1. ${seg1v1}\n2. ${seg2v1}`;
+  const seg3v1 = 'abc';
+  const transcript = `1. ${seg1v1}\n2. ${seg2v1}\n3. ${seg3v1}`;
   let r = await req('POST', '/api/doc/import', { title: '恢复测试', text: transcript }, rec);
   assert.strictEqual(r.status, 201);
   const segOf = async (which) => {
@@ -295,6 +297,65 @@ async function main() {
   const notif = (await req('GET', '/api/notifications', null, par)).json;
   const mine = notif.notifications.find((n) => n.toVersionId === pub2.json.versionId && n.seg === 1);
   ok(mine && mine.fromVersionId === newId, `关注者收到 ${newId}→${pub2.json.versionId} 段1 净变化通知`);
+
+  console.log('\n[先插后删回归：纯删除的新版空区间计入前面的插入，恢复不再错位]');
+  // 段3：v1「abc」→ v2 段首插「X」（Xabc）→ v3 删除「b」（Xac）。
+  // 缺陷版本对照 v1→v3 会把删 b 的新区间错报 [1,1)（正确 [2,2)），恢复编辑 [1,1)->"b" 得「bacX?」
+  // 之类错位结果，被恢复确认事务末尾的合版自检拒绝（整批不落提议）。
+  // 真实的“段首插入”是零长度纯插入提议（不能用整段替换模拟——整块重写与后续删除
+  // 在两端 LCS 对齐后会归并，模拟不出“先插入、后删除原字”的坐标链）。
+  async function zeroInsertAdoptPublish(seg, point, text, basis, note) {
+    const pr = await req('POST', '/api/proposals', { seg, start: point, end: point, replacement: text, basis }, rec);
+    assert.strictEqual(pr.status, 201, JSON.stringify(pr.json));
+    const ad = await req('POST', `/api/proposals/${pr.json.id}/adopt`, {}, rev);
+    assert.strictEqual(ad.status, 200, JSON.stringify(ad.json));
+    const pu = await req('POST', '/api/publish', { note }, rev);
+    assert.strictEqual(pu.status, 201, JSON.stringify(pu.json));
+    return pr.json.id;
+  }
+  await zeroInsertAdoptPublish(3, 0, 'X', '段首插入 X', '段3-插入'); // abc -> Xabc
+  await proposeAdoptPublish({ seg: 3, find: 'b', replacement: '', basis: '删除 b', note: '段3-删除' }); // Xabc -> Xac
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  const seg3CurVer = booth.currentVersion.id;
+  ok(seg3CurVer === 10, `段3 修订后当前为 v${seg3CurVer}（应 v10）`);
+  ok(booth.segments.find((s) => s.seg === 3).text === 'Xac', `v${seg3CurVer} 段3 正文为「Xac」`);
+
+  // 跨版对照 v1→当前：两处独立变化，删 b 的新版空区间必须是 [2,2)
+  const diffReg = (await req('GET', `/api/diff?from=1&to=${seg3CurVer}`, null, rev)).json;
+  const dseg3 = diffReg.segments.find((s) => s.seg === 3);
+  ok(dseg3 && dseg3.changeCount === 2, `段3 对照 1→v${seg3CurVer} 有 2 处净变化（实际 ${dseg3 && dseg3.changeCount}）`);
+  const dDel = dseg3.changes.find((h) => h.kind === 'delete');
+  const dIns = dseg3.changes.find((h) => h.kind === 'insert');
+  ok(dIns && dIns.old.start === 0 && dIns.old.end === 0 && dIns.now.start === 0 && dIns.now.end === 1 &&
+     dIns.now.text === 'X', '段3 插入块：旧 [0,0) → 新 [0,1)「X」');
+  ok(dDel && dDel.old.start === 1 && dDel.old.end === 2 && dDel.old.text === 'b' &&
+     dDel.now.start === 2 && dDel.now.end === 2,
+   `段3 删除块：旧 [1,2)「b」→ 新 [2,2)（实际 [${dDel && dDel.now.start},${dDel && dDel.now.end})）`);
+
+  // 恢复预览 v8→v1：删除块反译为“在当前 [2,2) 插入 b”，插入块反译为“删除 X”
+  pv = (await req('POST', '/api/restore/1/preview', { reason: '先插后删错位回归' }, rev)).json;
+  const rseg3 = pv.segments.find((s) => s.seg === 3);
+  ok(rseg3 && rseg3.changeCount === 2, `恢复预览含段3 两处变化（实际 ${rseg3 && rseg3.changeCount}）`);
+  // 确认：修复前此处合版自检失败（RESTORE_APPLY_MISMATCH，整批回滚）；修复后精确还原 abc
+  const cfReg = await req('POST', '/api/restore/confirm', { token: pv.token }, rev);
+  assert.strictEqual(cfReg.status, 201, `先插后删恢复确认应通过合版自检：${JSON.stringify(cfReg.json)}`);
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.previewSegments.find((s) => s.seg === 3).text === 'abc', '合版预览段3 精确还原目标 v1「abc」');
+  // 发布仍过现有异议门槛：段1 恢复回 v1 也触及此前待重定位的异议，须逐条回应（段3 无异议）
+  const gateReg = (await req('GET', '/api/publish-check', null, rev)).json;
+  ok(gateReg.items.length >= 2, `恢复确认后发布核对列出 ${gateReg.items.length} 条待回应异议（门槛不绕过）`);
+  for (const it of gateReg.items) {
+    const rr = await req('POST', `/api/objections/${it.objectionId}/respond`,
+      { note: '先插后删回归恢复，已核对原始记录，准予发布' }, rev);
+    assert.strictEqual(rr.status, 201, JSON.stringify(rr.json));
+  }
+  // 发布
+  const pubReg = await req('POST', '/api/publish', { note: '先插后删回归恢复' }, rev);
+  assert.strictEqual(pubReg.status, 201, `回归恢复发布失败：${JSON.stringify(pubReg.json)}`);
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  ok(booth.segments.find((s) => s.seg === 3).text === 'abc', '发布后段3 正文为「abc」');
+  const dClose = (await req('GET', `/api/diff?from=1&to=${pubReg.json.versionId}`, null, rev)).json;
+  ok(dClose.segments.find((s) => s.seg === 3).changeCount === 0, '恢复闭环：段3 对照 v1 净变化为零');
 
   console.log('\n[网页只读视图中的恢复关联与待回应状态]');
   // 参与者总览中不得暴露恢复提议的依据/替换（与普通提议同口径）——段1当前非保密，参与者可见已发布提议，

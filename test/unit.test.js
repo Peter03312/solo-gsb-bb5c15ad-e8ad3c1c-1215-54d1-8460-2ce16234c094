@@ -273,6 +273,57 @@ ok(dh.length === 2 && dh[0].kind === 'delete' && dh[0].old.start === 0 &&
    dh[1].kind === 'insert' && dh[1].now.text === '尾',
   '净变化：删除首字与段尾插入分属两块');
 
+// 同段先插入、后删除原字：纯删除的新版空区间必须计入前面的插入。
+// v1「abc」→ v2 段首插「X」（Xabc）→ v3 删「b」（Xac）：删「b」落在新版 [2,2)（Xa 之后），
+// 而非只数未变码点的 [1,1)；恢复编辑按 now 坐标生成，错位会被合版自检拒绝。
+dh = diffHunks('abc', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 0, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 2, end: 3, replace: '' }] },
+], 1, 3);
+ok(dh.length === 2 &&
+   dh.some((h) => h.kind === 'insert' && h.now.start === 0 && h.now.end === 1 && h.now.text === 'X') &&
+   dh.some((h) => h.kind === 'delete' && h.old.start === 1 && h.old.end === 2 && h.old.text === 'b' &&
+                  h.now.start === 2 && h.now.end === 2 && h.now.text === ''),
+  '净变化：先插后删时纯删除的新版空区间计入前面的插入（删 b 落在 [2,2)）');
+
+// 镜像口径：同段先删除、后插入时，纯插入的旧版空区间计入前面的删除。
+// v1「abc」→ v2 删「a」（bc）→ v3 段尾插「X」（bcX）：插入点在旧版 [3,3)（末尾），而非 [2,2)。
+dh = diffHunks('abc', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 1, replace: '' }] },
+  { version: 3, edits: [{ id: 2, start: 2, end: 2, replace: 'X' }] },
+], 1, 3);
+ok(dh.length === 2 &&
+   dh.some((h) => h.kind === 'delete' && h.now.start === 0 && h.now.end === 0) &&
+   dh.some((h) => h.kind === 'insert' && h.old.start === 3 && h.old.end === 3 &&
+                  h.now.start === 2 && h.now.end === 3 && h.now.text === 'X'),
+  '净变化：先删后插时纯插入的旧版空区间计入前面的删除（插入点落在旧版 [3,3)）');
+
+// 变化集合自洽：把各变化的旧侧区间编辑应用到旧版正文，必须逐码点还原新版正文；
+// 反向（恢复编辑：新版 now 区间替换为 old.text）必须逐码点还原旧版正文。
+{
+  const cases = [
+    ['abc', [
+      { version: 2, edits: [{ id: 1, start: 0, end: 0, replace: 'X' }] },
+      { version: 3, edits: [{ id: 2, start: 2, end: 3, replace: '' }] },
+    ], 1, 3],
+    ['abcde', [
+      { version: 2, edits: [{ id: 1, start: 2, end: 4, replace: '' }] },
+      { version: 3, edits: [{ id: 2, start: 3, end: 3, replace: 'X' }] },
+    ], 1, 3],
+    ['甲乙丙丁', [{ version: 2, edits: [
+      { id: 1, start: 0, end: 1, replace: '' },
+      { id: 2, start: 3, end: 3, replace: '尾' },
+    ] }], 1, 2],
+  ];
+  for (const [initial, steps, a, b] of cases) {
+    const r = diffLineage(initial, steps, a, b);
+    const fwd = applyEdits(r.versions[a], r.hunks.map((h) => ({ start: h.old.start, end: h.old.end, replace: h.now.text })));
+    const back = applyEdits(r.versions[b], r.hunks.map((h) => ({ start: h.now.start, end: h.now.end, replace: h.old.text })));
+    ok(fwd === r.versions[b] && back === r.versions[a],
+      `净变化区间自洽（${initial} → ${r.versions[b]}）：旧侧编辑还原新版、恢复编辑还原旧版`);
+  }
+}
+
 // 未变段（版本发布了其他段的修订，但该段在 a→b 区间无任何步骤）：不产生变化块
 dh = diffHunks('无改动段落', [], 1, 2);
 ok(dh.length === 0 && diffLineage('无改动段落', [], 1, 2).versions[2] === '无改动段落',

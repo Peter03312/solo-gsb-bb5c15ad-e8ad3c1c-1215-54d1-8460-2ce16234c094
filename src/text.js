@@ -284,10 +284,15 @@ function diffLineage(initialText, steps, aVersion, bVersion) {
   for (const h of rawHunks) {
     const dels = h.ops.filter((o) => o.op === 'del');
     const inss = h.ops.filter((o) => o.op === 'ins');
-    // 半开区间按各自版本码点下标；纯插入/纯删除的空区间落在共同的对齐间隙处
-    const oldStart = dels.length ? dels[0].aPos : inss[0].gap;
+    // 半开区间按各自版本码点下标。纯插入的旧版空区间、纯删除的新版空区间必须落在
+    // 该变化于对应版本中的实际码点位置：aPos/bPos 已计入其前的删除/插入码点，
+    // 而“对齐间隙” gap 只数两端未变的码点——同段先插入、后删除原字（或先删后插）时，
+    // 用 gap 会让纯删除的新版落点（纯插入的旧版落点）少算前面的插入（删除）而错位
+    // （如 v1「abc」段首插「X」再删「b」得「Xac」，删「b」的新版落点是 [2,2) 而非 [1,1)），
+    // 据此生成的恢复编辑会插错位置、被合版自检拒绝。
+    const oldStart = dels.length ? dels[0].aPos : inss[0].aPos;
     const oldEnd = dels.length ? dels[dels.length - 1].aPos + 1 : oldStart;
-    const newStart = inss.length ? inss[0].bPos : dels[0].gap;
+    const newStart = inss.length ? inss[0].bPos : dels[0].bPos;
     const newEnd = inss.length ? inss[inss.length - 1].bPos + 1 : newStart;
     const oldIds = dels.map((o) => seqA[o.ai]);
     const newIds = inss.map((o) => seqB[o.bj]);

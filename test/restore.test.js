@@ -3,6 +3,7 @@
 // 覆盖：预览/确认的拒绝场景、净变化逐段提议、重复文字不靠同文搜索、未变化范围不触及异议、
 // 仅空暂存可确认、预览后版本/暂存变化整次拒绝不留部分提议、确认后经异议门槛发布为新不可变版本、
 // 旧版/决议不改写、关联目标版本、附件不继承（恢复提议由复核员生成，无附件）、通知按净变化产生。
+// 回归：同段先插入、后删除原字时，纯删除的新版空区间计入前面的插入（对照坐标与恢复确认不再错位）。
 process.env.DATA_DIR = '/tmp/hrc-restore-data';
 process.env.PORT = '3988';
 process.env.HOST = '127.0.0.1';
@@ -302,6 +303,65 @@ async function main() {
   const parBooth = (await req('GET', '/api/booth', null, par)).json;
   ok(!('publishCheck' in parBooth), '参与者总览不含 publishCheck');
   ok(parBooth.versions.every((v) => v.note === ''), '参与者看不到版本备注');
+
+  console.log('\n[先插后删的纯删除落点：跨版对照坐标与恢复确认回归]');
+  // 任务场景：同段先插入、后删除原字。当前段2 为「保留段落始终不变。」
+  // vIns：段2 段首插入「X」→「X保留段落始终不变。」；vDel：删除原字「留」→「X保段落始终不变。」
+  booth = (await req('GET', '/api/booth', null, rev)).json;
+  const vPrev = booth.currentVersion.id;
+  ok(booth.segments.find((s) => s.seg === 2).text === seg2v1, '段2 当前仍为初始文字（构造先插后删场景）');
+  async function publishClearingGate(note) {
+    const gateNow = (await req('GET', '/api/publish-check', null, rev)).json;
+    for (const it of gateNow.items) {
+      const rr = await req('POST', `/api/objections/${it.objectionId}/respond`,
+        { note: '先插后删场景发布，已核对，准予发布' }, rev);
+      assert.strictEqual(rr.status, 201, JSON.stringify(rr.json));
+    }
+    const p = await req('POST', '/api/publish', { note }, rev);
+    assert.strictEqual(p.status, 201, `发布失败：${JSON.stringify(p.json)}`);
+    return p.json.versionId;
+  }
+  // vIns：段首纯插入「X」
+  const insX = await req('POST', '/api/proposals',
+    { seg: 2, start: 0, end: 0, replacement: 'X', basis: '先插后删：段首插入' }, rec);
+  assert.strictEqual(insX.status, 201, JSON.stringify(insX.json));
+  await req('POST', `/api/proposals/${insX.json.id}/adopt`, {}, rev);
+  const vIns = await publishClearingGate('先插后删：段首插 X');
+  // vDel：删除原字「留」（vIns 坐标下「X保留…」中位于 [2,3)）
+  const delL = await req('POST', '/api/proposals',
+    { seg: 2, start: 2, end: 3, replacement: '', basis: '先插后删：删除原字' }, rec);
+  assert.strictEqual(delL.status, 201, JSON.stringify(delL.json));
+  await req('POST', `/api/proposals/${delL.json.id}/adopt`, {}, rev);
+  const vDel = await publishClearingGate('先插后删：删原字');
+  const seg2After = (await req('GET', '/api/booth', null, rev)).json.segments.find((s) => s.seg === 2).text;
+  ok(seg2After === 'X保段落始终不变。', `先插后删后段2 正文：${seg2After}`);
+
+  // 对照 vPrev→vDel：纯删除「留」的新版空区间必须计入前面的插入，落在 [2,2)（“X保”之后）而非 [1,1)
+  const dFix = (await req('GET', `/api/diff?from=${vPrev}&to=${vDel}`, null, rev)).json;
+  const s2fix = dFix.segments.find((s) => s.seg === 2);
+  const insH = s2fix.changes.find((c) => c.kind === 'insert');
+  const delH = s2fix.changes.find((c) => c.kind === 'delete');
+  ok(insH && insH.old.start === 0 && insH.old.end === 0 &&
+     insH.now.start === 0 && insH.now.end === 1 && insH.now.text === 'X',
+    '对照：段首插入 X 报为纯插入（旧 [0,0) / 新 [0,1)）');
+  ok(delH && delH.old.start === 1 && delH.old.end === 2 && delH.old.text === '留' &&
+     delH.now.start === 2 && delH.now.end === 2 && delH.now.text === '',
+    `对照：删「留」的新版空区间计入前面的插入，落在 [2,2)（实际 [${delH && delH.now.start},${delH && delH.now.end})）`);
+
+  // 恢复 vDel → vPrev：恢复编辑按修正后的当前版坐标生成，确认通过合版自检（此前错位会整批拒绝）
+  pv = (await req('POST', `/api/restore/${vPrev}/preview`, { reason: '先插后删场景恢复回归' }, rev)).json;
+  const ps2 = pv.segments.find((s) => s.seg === 2);
+  ok(ps2 && ps2.changes.some((c) => c.restoreKind === 'insert' &&
+     c.now.start === 2 && c.now.end === 2 && c.old.text === '留'),
+    '恢复预览：在当前版 [2,2) 处插回「留」（落点计入前面的插入）');
+  const cfFix = await req('POST', '/api/restore/confirm', { token: pv.token }, rev);
+  assert.strictEqual(cfFix.status, 201, `确认应通过合版自检：${JSON.stringify(cfFix.json)}`);
+  ok(cfFix.json.proposals.some((p) => p.seg === 2 && p.start === 2 && p.end === 2 && p.replacement === '留'),
+    '恢复提议含 [2,2)→「留」的纯插入编辑（当前版坐标）');
+  const vRestored = await publishClearingGate('先插后删场景恢复发布');
+  const seg2Restored = (await req('GET', `/api/versions/${vRestored}`, null, rev)).json
+    .segments.find((s) => s.seg === 2).text;
+  ok(seg2Restored === seg2v1, `恢复发布后段2 逐码点等于目标快照：${seg2Restored}`);
 
   console.log(`\n恢复功能端到端测试通过：${passed} 项断言 ✅`);
   process.exit(0);
